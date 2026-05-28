@@ -1,16 +1,25 @@
 # ---- 构建 ----
-FROM golang:1.23-alpine AS build
+FROM golang:alpine AS build
+ENV GO111MODULE=on CGO_ENABLED=0
+ENV GOPROXY=https://goproxy.cn,direct
+
 WORKDIR /src
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/server-http  ./cmd/http && \
-    CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/server-grpc ./cmd/grpc
+RUN go build -ldflags="-s -w" -o /out/server-http  ./cmd/http && \
+    go build -ldflags="-s -w" -o /out/server-grpc ./cmd/grpc
 
 # ---- 运行 ----
-FROM gcr.io/distroless/static-debian12
+FROM alpine
+
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates \
+    && update-ca-certificates
+
 COPY --from=build /out/server-http /out/server-grpc /
 COPY rules/ /rules/
 

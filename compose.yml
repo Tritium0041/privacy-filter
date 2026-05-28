@@ -1,0 +1,19 @@
+networks:
+  infrastructure:
+    external: true        # 与 packy-api / 其他 compose 栈共享
+
+services:
+  privacy-filter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: privacy-filter:dev
+    container_name: privacy-filter
+    entrypoint: ["/server-grpc"]
+    networks: [infrastructure]
+    ports:
+      - "8089:8089"       # 仅本机直接连用，生产可以删掉只走内部网络
+    environment:
+      PF_GRPC_PORT: "8089"
+      PF_GITLEAKS_TOML: "/rules/gitleaks.toml"
+    restart: unless-stopped
