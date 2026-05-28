@@ -1,0 +1,11 @@
+bin/
+.venv/
+venv/
+app/
+tests/
+scripts/
+__pycache__/
+*.pyc
+.pytest_cache/
+requirements.txt
+*.md

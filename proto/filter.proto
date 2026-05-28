@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package filter.v1;
+
+option go_package = "privacyfilter/gen/filterpb";
+
+// PrivacyFilter 在文本进入 LLM 前过滤 PII 与密钥。
+service PrivacyFilter {
+  // Redact 脱敏单条文本。
+  rpc Redact(RedactRequest) returns (RedactResponse);
+  // RedactBatch 批量脱敏。
+  rpc RedactBatch(RedactBatchRequest) returns (RedactBatchResponse);
+}
+
+message RedactRequest {
+  string text = 1;
+}
+
+// Entity 是一个被脱敏的命中项。start/end 为 UTF-8 字节偏移。
+message Entity {
+  string type = 1;
+  int32 start = 2;
+  int32 end = 3;
+  string text = 4;
+}
+
+message RedactResponse {
+  string redacted = 1;          // 脱敏后文本，转发给 LLM 用这个
+  bool hit = 2;
+  int32 count = 3;
+  repeated Entity entities = 4;
+  double elapsed_ms = 5;
+}
+
+message RedactBatchRequest {
+  repeated string texts = 1;
+}
+
+message RedactBatchResponse {
+  repeated RedactResponse results = 1;
+}

@@ -1,0 +1,25 @@
+# 构建产物
+bin/
+*.exe
+
+# Python 虚拟环境（本地保留，不上传）
+.venv/
+venv/
+
+# 残留 Python 缓存
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# 本地环境配置
+.env
+.env.local
