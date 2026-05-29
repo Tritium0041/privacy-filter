@@ -91,6 +91,32 @@ func TestEntropyFallback(t *testing.T) {
 
 // --- 高熵兜底反误报 ---
 
+// SSH 命令上下文里的 user@host 不当邮箱（允许命令前有自然语言前缀）。
+func TestSSHCommandContextSkipsEmail(t *testing.T) {
+	f := newFilter(t)
+	cases := []string{
+		"ssh user@host.example.com",
+		"ssh -i ~/.ssh/id_rsa user@host.example.com",
+		"打开 ssh user@host.example.com",
+		"scp file.txt user@host.example.com:/data/",
+		"rsync -av /src/ user@host.example.com:/dst/",
+	}
+	for _, in := range cases {
+		if got := redact(t, f, in); strings.Contains(got, "[邮箱]") {
+			t.Errorf("SSH 目标被误判成邮箱: in=%q got=%q", in, got)
+		}
+	}
+}
+
+// 反面：纯邮箱（无 ssh 命令前缀）仍要脱
+func TestSSHCommandContextPlainEmailStillRedacted(t *testing.T) {
+	f := newFilter(t)
+	in := "我的邮箱是 alice@example.com 请保密"
+	if got := redact(t, f, in); !strings.Contains(got, "[邮箱]") {
+		t.Errorf("普通邮箱漏脱: %q", got)
+	}
+}
+
 // 回归 case：ls 命令传入长路径时，路径片段被熵兜底误判成密钥。
 func TestEntropyFallbackSkipsFilesystemPath(t *testing.T) {
 	f := newFilter(t)

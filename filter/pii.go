@@ -19,13 +19,13 @@ var (
 var sshCommands = []string{"ssh ", "scp ", "rsync ", "sftp ", "ssh-copy-id ", "ssh-keygen "}
 
 // isInSSHCommandContext 检查 email 命中是否处于 ssh/scp/rsync 命令行里。
-// 找到 email 所在行，看行首是否是上述命令。
+// 找到 email 所在行，看行内是否出现 ssh/scp/rsync 命令前缀（不限行首，
+// 容忍 "打开 ssh user@host" 这种自然语言包裹）。
 func isInSSHCommandContext(text string, emailStart int) bool {
 	lineStart := strings.LastIndexByte(text[:emailStart], '\n') + 1
 	line := text[lineStart:emailStart]
-	trimmed := strings.TrimLeft(line, " \t")
 	for _, cmd := range sshCommands {
-		if strings.HasPrefix(trimmed, cmd) {
+		if strings.Contains(line, cmd) {
 			return true
 		}
 	}
