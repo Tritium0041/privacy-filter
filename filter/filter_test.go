@@ -89,6 +89,72 @@ func TestEntropyFallback(t *testing.T) {
 	}
 }
 
+// --- 高熵兜底反误报 ---
+
+// 客户原始 case：ls 命令传入长路径，路径片段被当成密钥。
+func TestEntropyFallbackSkipsFilesystemPath(t *testing.T) {
+	f := newFilter(t)
+	in := "ls /home/user/AbCdEfGh1234567890XyZ"
+	if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+		t.Errorf("文件路径被误判: %q", got)
+	}
+}
+
+// URL path segment 不应被脱敏。
+func TestEntropyFallbackSkipsURLPath(t *testing.T) {
+	f := newFilter(t)
+	in := "curl https://api.example.com/v1/users/AbCdEfGh1234567890XyZ"
+	if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+		t.Errorf("URL 路径被误判: %q", got)
+	}
+}
+
+// S3 / 对象存储路径。
+func TestEntropyFallbackSkipsS3URI(t *testing.T) {
+	f := newFilter(t)
+	in := "aws s3 cp s3://my-bucket/dir/AbCdEfGh1234567890XyZ ."
+	if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+		t.Errorf("S3 URI 被误判: %q", got)
+	}
+}
+
+// 容器镜像 sha256 摘要。
+func TestEntropyFallbackSkipsSha256Digest(t *testing.T) {
+	f := newFilter(t)
+	in := "docker pull registry.io/img@sha256:9f86d081884c7d659a2feaa0c55ad015b1b8a3e6b1d2c4a5e9f8b7d6c5a4b3210"
+	if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+		t.Errorf("sha256 摘要被误判: %q", got)
+	}
+}
+
+// 邮件附件 / 邮箱本身的 domain 段不应触发兜底（域名内 . 边界）。
+func TestEntropyFallbackSkipsHostname(t *testing.T) {
+	f := newFilter(t)
+	in := "host=long-subdomain-with-many-chars.example.com"
+	if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+		t.Errorf("主机名被误判: %q", got)
+	}
+}
+
+// 有 token 关键词的命令行（候选串与关键词同段），仍然要脱敏。
+func TestEntropyFallbackKeepsTokenWithContext(t *testing.T) {
+	f := newFilter(t)
+	in := "请使用 token aB3xK9pLmN2qR7sT5vW1zY 调试"
+	if got := redact(t, f, in); !strings.Contains(got, "[密钥]") {
+		t.Errorf("带 token 关键词的随机串未脱敏: %q", got)
+	}
+}
+
+// 普通乱码无 context（既无密钥语义关键词，也无路径边界）走严格阈值。
+// 22 字符全异熵 ≈ 4.46，不到 4.8 → 应被放过，避免误伤普通 ID。
+func TestEntropyFallbackStrictThresholdSkipsModerateEntropy(t *testing.T) {
+	f := newFilter(t)
+	in := "订单编号 aB3xK9pLmN2qR7sT5vW1zY 已记账"
+	if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+		t.Errorf("无密钥语义的中等乱度串不应脱敏: %q", got)
+	}
+}
+
 // --- 整体行为 ---
 
 func TestCleanTextNoHit(t *testing.T) {

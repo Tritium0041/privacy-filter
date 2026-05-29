@@ -8,7 +8,11 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-const entropyMin = 4.0
+const (
+	entropyMin       = 4.0 // 高熵兜底默认阈值（贴近 gitleaks 经验值）
+	entropyMinStrict = 4.8 // 周围无密钥语义关键词时启用，进一步压低误报
+	contextLookback  = 30  // hasSecretContext 往前回溯字节数
+)
 
 // 上下文型口令：藏在句子里的密码/token，如「我的密码是 hunter2」「api_key: xxx」。
 var reContextSecret = regexp.MustCompile(
@@ -16,6 +20,26 @@ var reContextSecret = regexp.MustCompile(
 
 // 高熵兜底：抓不匹配任何已知格式的随机串。
 var reEntropyToken = regexp.MustCompile(`[A-Za-z0-9+/=_\-]{20,}`)
+
+// 密钥语义关键词。命中表示候选串身处"明显在谈密钥"的上下文里，
+// 保留 entropyMin；不命中则用 entropyMinStrict 收紧阈值。
+var reSecretContext = regexp.MustCompile(
+	`(?i)(?:password|passwd|pwd|secret|token|api[_\s-]?key|access[_\s-]?key|bearer|authorization|credential|jwt|密码|口令|密钥|凭证|令牌|鉴权)`)
+
+// 路径/URL/哈希边界字符。客户实际遇到的误伤都是这一类：
+//   - 候选串内部含 / \ :   → 整段就是路径
+//   - 候选串左右贴上面+ . @ ? = → 路径分段 / sha256: / @host / query 参数
+const (
+	pathBoundaryChars = `/\:.@?=`
+	pathInternalChars = `/\:`
+)
+
+// 协议/哈希前缀，候选串左侧短回溯命中即视作路径片段。
+var urlPrefixes = []string{
+	"http://", "https://", "ftp://", "ssh://",
+	"s3://", "gs://", "oss://",
+	"git@", "sha256:", "sha1:", "md5:",
+}
 
 type secretRule struct {
 	id          string
@@ -124,11 +148,54 @@ func (sd *secretDetector) detect(text string) []span {
 	}
 	// 高熵兜底
 	for _, m := range reEntropyToken.FindAllStringIndex(text, -1) {
-		if shannonEntropy(text[m[0]:m[1]]) >= entropyMin {
-			spans = append(spans, span{m[0], m[1], "[密钥]"})
+		s, e := m[0], m[1]
+		if isOnPathOrURLBoundary(text, s, e) {
+			continue
+		}
+		threshold := entropyMin
+		if !hasSecretContext(text, s, e) {
+			threshold = entropyMinStrict
+		}
+		if shannonEntropy(text[s:e]) >= threshold {
+			spans = append(spans, span{s, e, "[密钥]"})
 		}
 	}
 	return spans
+}
+
+// isOnPathOrURLBoundary 判断 [start,end) 是否处于路径 / URL / 哈希等"非密钥"上下文。
+// 命中即跳过，避开 ls /a/AbCd...、s3://bucket/key、@sha256:hash 这类客户实际遇到的误伤。
+func isOnPathOrURLBoundary(text string, start, end int) bool {
+	if strings.ContainsAny(text[start:end], pathInternalChars) {
+		return true
+	}
+	if start > 0 && strings.IndexByte(pathBoundaryChars, text[start-1]) >= 0 {
+		return true
+	}
+	if end < len(text) && strings.IndexByte(pathBoundaryChars, text[end]) >= 0 {
+		return true
+	}
+	lo := start - 8
+	if lo < 0 {
+		lo = 0
+	}
+	look := text[lo:start]
+	for _, p := range urlPrefixes {
+		if strings.Contains(look, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSecretContext 检查 [start-contextLookback, end) 区间是否出现密钥语义关键词，
+// 命中保留 entropyMin，否则改用更严的 entropyMinStrict。
+func hasSecretContext(text string, start, end int) bool {
+	lo := start - contextLookback
+	if lo < 0 {
+		lo = 0
+	}
+	return reSecretContext.MatchString(text[lo:end])
 }
 
 // ruleApplies 做关键词预筛：无关键词的规则总是参与，
