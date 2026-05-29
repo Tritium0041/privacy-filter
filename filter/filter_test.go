@@ -91,7 +91,7 @@ func TestEntropyFallback(t *testing.T) {
 
 // --- 高熵兜底反误报 ---
 
-// 客户原始 case：ls 命令传入长路径，路径片段被当成密钥。
+// 回归 case：ls 命令传入长路径时，路径片段被熵兜底误判成密钥。
 func TestEntropyFallbackSkipsFilesystemPath(t *testing.T) {
 	f := newFilter(t)
 	in := "ls /home/user/AbCdEfGh1234567890XyZ"
@@ -152,6 +152,82 @@ func TestEntropyFallbackStrictThresholdSkipsModerateEntropy(t *testing.T) {
 	in := "订单编号 aB3xK9pLmN2qR7sT5vW1zY 已记账"
 	if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
 		t.Errorf("无密钥语义的中等乱度串不应脱敏: %q", got)
+	}
+}
+
+// --- 强上下文凌驾路径检查 ---
+
+// Bearer 真密钥含 base64 padding 的 / —— 不能被 Step 1 当路径放过。
+func TestStrongContextOverridesPathBoundary_BearerWithSlash(t *testing.T) {
+	f := newFilter(t)
+	in := `Authorization: Bearer abcDEF1234567890/xyzABC4567890==`
+	if got := redact(t, f, in); !strings.Contains(got, "[密钥]") {
+		t.Errorf("Bearer 真密钥被路径检查放过: %q", got)
+	}
+}
+
+// 反面：api_key 出现在域名里（不是赋值结构）→ 仍走路径检查 → 不脱
+func TestStrongContextNotTriggeredByPathKeyword(t *testing.T) {
+	f := newFilter(t)
+	in := `api_key.example.com/AbCdEfGh1234567890XyZ`
+	if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+		t.Errorf("api_key.example.com 域名段被误判: %q", got)
+	}
+}
+
+// --- Post Validators ---
+
+// 模板变量不脱
+func TestPostValidatorSkipsTemplateVar(t *testing.T) {
+	f := newFilter(t)
+	cases := []string{
+		`secret={{ API_KEY }} 或 token=${TOKEN}`,
+		`config: token=%{TOKEN}`,
+		`auth=<API_KEY>`,
+	}
+	for _, in := range cases {
+		if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+			t.Errorf("模板变量被误判: in=%q got=%q", in, got)
+		}
+	}
+}
+
+// 业务 ID 不脱
+func TestPostValidatorSkipsBusinessIDAssignment(t *testing.T) {
+	f := newFilter(t)
+	cases := []string{
+		`order_id=aB3xK9pLmN2qR7sT5vW1zY`,
+		`user_id=AbCdEfGh1234567890XyZQwErTyUiOp`,
+		`session_no=aB3xK9pLmN2qR7sT5vW1zY1234`,
+	}
+	for _, in := range cases {
+		if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+			t.Errorf("业务 ID 被误判: in=%q got=%q", in, got)
+		}
+	}
+}
+
+// UUID 不脱
+func TestPostValidatorSkipsUUID(t *testing.T) {
+	f := newFilter(t)
+	in := `trace_id=550e8400-e29b-41d4-a716-446655440000`
+	if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+		t.Errorf("UUID 被误判: %q", got)
+	}
+}
+
+// 长度=32/40/64 的纯 hex hash 不脱（md5/sha1/sha256）
+func TestPostValidatorSkipsHexHash(t *testing.T) {
+	f := newFilter(t)
+	cases := []string{
+		`md5: 9f86d081884c7d659a2feaa0c55ad015`,
+		`sha1: da39a3ee5e6b4b0d3255bfef95601890afd80709`,
+		`commit 9f86d081884c7d659a2feaa0c55ad015b1b8a3e6b1d2c4a5e9f8b7d6c5a4b3210`,
+	}
+	for _, in := range cases {
+		if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+			t.Errorf("hex hash 被误判: in=%q got=%q", in, got)
+		}
 	}
 }
 

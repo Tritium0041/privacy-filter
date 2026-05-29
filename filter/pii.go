@@ -1,6 +1,9 @@
 package filter
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // 结构化 PII 正则。Go 的 regexp 是 RE2，不支持前后向断言，
 // 因此数字边界用 digitBounded / ipBounded 在匹配后手工校验。
@@ -11,6 +14,23 @@ var (
 	reBankCard = regexp.MustCompile(`[0-9]{13,19}`)
 	reIPv4     = regexp.MustCompile(`(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])`)
 )
+
+// 远程命令前缀。user@host 出现在这些命令上下文里通常是 SSH 目标，不是邮箱。
+var sshCommands = []string{"ssh ", "scp ", "rsync ", "sftp ", "ssh-copy-id ", "ssh-keygen "}
+
+// isInSSHCommandContext 检查 email 命中是否处于 ssh/scp/rsync 命令行里。
+// 找到 email 所在行，看行首是否是上述命令。
+func isInSSHCommandContext(text string, emailStart int) bool {
+	lineStart := strings.LastIndexByte(text[:emailStart], '\n') + 1
+	line := text[lineStart:emailStart]
+	trimmed := strings.TrimLeft(line, " \t")
+	for _, cmd := range sshCommands {
+		if strings.HasPrefix(trimmed, cmd) {
+			return true
+		}
+	}
+	return false
+}
 
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }
 
@@ -57,6 +77,15 @@ func luhnValid(num string) bool {
 func detectPII(text string) []span {
 	var spans []span
 	for _, m := range reEmail.FindAllStringIndex(text, -1) {
+		// SSH-style URL: user@host:path —— 邮箱后紧接 ":" + 非空白字符 → 视作 git@ URL，不脱
+		if m[1] < len(text) && text[m[1]] == ':' &&
+			m[1]+1 < len(text) && text[m[1]+1] != ' ' && text[m[1]+1] != '\t' {
+			continue
+		}
+		// SSH 命令上下文：ssh / scp / rsync user@host 这种调用，host 不是邮箱
+		if isInSSHCommandContext(text, m[0]) {
+			continue
+		}
 		spans = append(spans, span{m[0], m[1], "[邮箱]"})
 	}
 	for _, m := range rePhoneCN.FindAllStringIndex(text, -1) {
