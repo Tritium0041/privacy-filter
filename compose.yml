@@ -1,6 +1,6 @@
 networks:
   infrastructure:
-    external: true        # 与 packy-api / 其他 compose 栈共享
+    external: true
 
 services:
   privacy-filter:
