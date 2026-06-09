@@ -1,80 +1,97 @@
-# Privacy Filter — 隐私过滤（Go）
+# Privacy Filter (Go)
 
-在文本进入 LLM 之前，过滤掉用户的敏感信息（PII / 密钥）。
-纯 Go、无模型、无 GPU、无 CGO —— 单个静态二进制，任何长度文本都是毫秒级。
+**English** | [简体中文](README.zh-CN.md)
 
-## 三种用法
+Strip sensitive user data (PII / secrets) from text before it reaches an LLM.
+Pure Go, no model, no GPU, no CGO — a single static binary, millisecond latency on text of any length.
 
-1. **核心包**：网关直接 `import "privacyfilter/filter"`，过滤是一次函数调用，无 HTTP 跳转。
-2. **HTTP 服务**：`cmd/http`，REST 接口。
-3. **gRPC 服务**：`cmd/grpc`，接口见 `proto/filter.proto`。
+🌐 Running in production at [PackyCode](https://www.packyapi.com) — the privacy-compliance component of an API relay service.
 
-后两个都只是核心包 `filter` 的薄封装。
+---
 
-## 两层检测
+## Three ways to use it
 
-| 层 | 负责 | 技术 |
+1. **Core package**: `import "privacyfilter/filter"` straight into your gateway — redaction is one function call, no HTTP hop.
+2. **HTTP service**: `cmd/http`, REST API.
+3. **gRPC service**: `cmd/grpc`, interface in `proto/filter.proto`.
+
+The latter two are thin wrappers around the `filter` core package.
+
+---
+
+## Two detection layers
+
+| Layer | Covers | Technique |
 |---|---|---|
-| 结构化 PII | 邮箱、手机号、身份证、银行卡（Luhn 校验）、IP | 正则 |
-| 密钥 / 凭证 | API key、token、私钥、句子里的口令、未知高熵随机串 | gitleaks 规则集（关键词预筛）+ 上下文正则 + 香农熵兜底 |
+| Structured PII | Email, phone, national ID, bank card (Luhn-checked), IP | Regex |
+| Secrets / credentials | API keys, tokens, private keys, passwords written in prose, unknown high-entropy strings | gitleaks ruleset (keyword pre-filter) + contextual regex + Shannon-entropy fallback |
 
-各层产出 `(起点, 终点, 占位符)` 区间 → 合并去重叠 → 单遍重建文本。
-占位符带类型（`[邮箱] [电话] [身份证] [银行卡] [IP] [密钥]`），不可逆（不还原）。
+Each layer emits `(start, end, placeholder)` spans → spans are merged and de-overlapped → the text is rebuilt in a single pass.
+Placeholders are typed and carry the entity kind — `[邮箱]` (email), `[电话]` (phone), `[身份证]` (national ID), `[银行卡]` (bank card), `[IP]`, `[密钥]` (secret) — and are irreversible (no un-redaction).
 
-> 不含人名/地名/机构识别 —— 那类需要 NER 模型，CPU 上对长文本要数秒，已按需求移除。
-> 高危身份信息（身份证/银行卡/密钥等）全部由正则覆盖。
+> No person / place / organization name recognition — that needs an NER model, which costs seconds of CPU time on long text and was removed per requirements.
+> High-risk identity data (national ID, bank card, secrets, etc.) is fully covered by regex.
 
-## 目录结构
+---
+
+## Layout
 
 ```
 privacy-filter/
 ├── go.mod / go.sum
-├── filter/                  核心包（可被网关直接 import）
+├── filter/                  core package (import directly from a gateway)
 │   ├── filter.go            Filter / New / Redact
-│   ├── pii.go               结构化 PII
-│   ├── secrets.go           gitleaks + 上下文 + 熵
+│   ├── pii.go               structured PII
+│   ├── secrets.go           gitleaks + context + entropy
 │   └── filter_test.go
 ├── cmd/
-│   ├── http/main.go         HTTP 服务
-│   └── grpc/main.go         gRPC 服务
-├── proto/filter.proto       gRPC 接口定义
-├── gen/filterpb/            protoc 生成的代码
-├── rules/gitleaks.toml      gitleaks 规则集
-├── scripts/fetch_rules.sh   规则更新脚本
+│   ├── http/main.go         HTTP service
+│   └── grpc/main.go         gRPC service
+├── proto/filter.proto       gRPC interface definition
+├── gen/filterpb/            protoc-generated code
+├── rules/gitleaks.toml      gitleaks ruleset
+├── scripts/fetch_rules.sh   ruleset update script
 └── Dockerfile
 ```
 
-## 构建
+---
+
+## Build
 
 ```bash
 go build -o bin/server-http ./cmd/http
 go build -o bin/server-grpc ./cmd/grpc
-go test ./...                          # 跑全部测试
+go test ./...                          # run all tests
 ```
 
-## 用法 1：核心包（推荐网关用这个）
+---
+
+## Usage
+
+### 1. Core package (recommended for gateways)
 
 ```go
 import "privacyfilter/filter"
 
-// 启动时创建一次，并发安全，可全局复用
-f, err := filter.New("rules/gitleaks.toml")   // 传 "" 则用内置兜底规则
+// Create once at startup; concurrency-safe, reuse globally.
+f, err := filter.New("rules/gitleaks.toml")   // pass "" to use the built-in fallback rules
 
-// 每个请求
+// Per request
 res := f.Redact(userPrompt)
-forwardToLLM(res.Redacted)                    // 用脱敏后的文本转发给 LLM
+forwardToLLM(res.Redacted)                    // forward the redacted text to the LLM
 ```
 
-`filter.Result`：`Redacted`（脱敏后文本）、`Hit`、`Count`、`Entities`（命中明细，
-含类型与字节偏移）。
+`filter.Result`: `Redacted` (redacted text), `Hit`, `Count`, `Entities` (hit details,
+including type and byte offsets).
 
-> 从你自己的网关模块引用本包：放进同一个 monorepo，或在网关的 go.mod 里加
-> `replace privacyfilter => ../privacy-filter`。`filter` 包只依赖 `BurntSushi/toml`。
+> To consume this package from your own gateway module: put it in the same monorepo, or add
+> `replace privacyfilter => ../privacy-filter` to the gateway's go.mod. The `filter` package
+> depends only on `BurntSushi/toml`.
 
-## 用法 2：HTTP 服务
+### 2. HTTP service
 
 ```bash
-./bin/server-http                    # 默认 :8088
+./bin/server-http                    # default :8088
 ```
 
 ```bash
@@ -84,50 +101,61 @@ curl -X POST http://127.0.0.1:8088/redact -H 'Content-Type: application/json' \
 # {"redacted":"我的邮箱是 [邮箱]，密码是 [密钥]","hit":true,"count":2,"entities":[...],"elapsed_ms":0.08}
 ```
 
-接口：`GET /health`、`POST /redact`、`POST /redact/batch`（`{"texts":[...]}`）。
+Endpoints: `GET /health`, `POST /redact`, `POST /redact/batch` (`{"texts":[...]}`).
 
-## 用法 3：gRPC 服务
+### 3. gRPC service
 
 ```bash
-./bin/server-grpc                    # 默认 :8089
+./bin/server-grpc                    # default :8089
 ```
 
-服务 `filter.v1.PrivacyFilter`，方法 `Redact` / `RedactBatch`，定义见 `proto/filter.proto`。
-网关侧用该 proto 生成客户端即可。重新生成本仓代码：
+Service `filter.v1.PrivacyFilter`, methods `Redact` / `RedactBatch`, defined in `proto/filter.proto`.
+Generate a client from that proto on the gateway side. To regenerate the code in this repo:
 
 ```bash
 protoc -I. --go_out=. --go_opt=module=privacyfilter \
        --go-grpc_out=. --go-grpc_opt=module=privacyfilter proto/filter.proto
 ```
 
-## 配置（环境变量）
+---
 
-| 变量 | 默认 | 说明 |
+## Configuration (environment variables)
+
+| Variable | Default | Description |
 |---|---|---|
-| `PF_PORT` | `8088` | HTTP 监听端口 |
-| `PF_GRPC_PORT` | `8089` | gRPC 监听端口 |
-| `PF_GITLEAKS_TOML` | `rules/gitleaks.toml` | gitleaks 规则文件路径 |
+| `PF_PORT` | `8088` | HTTP listen port |
+| `PF_GRPC_PORT` | `8089` | gRPC listen port |
+| `PF_GITLEAKS_TOML` | `rules/gitleaks.toml` | path to the gitleaks rules file |
 
-## 性能（本机 benchmark，合成的高密度 PII 文本，属最坏情况）
+---
 
-| 文本长度 | 耗时 |
+## Performance (local benchmark, synthetic high-density PII text — worst case)
+
+| Text length | Latency |
 |---|---|
 | ~50 B | ~0.01ms |
 | ~2 KB | ~0.46ms |
 | ~32 KB | ~9ms |
 
-两层都是 O(n)。真实 prompt（PII 没这么密）会更快。
+Both layers are O(n). Real prompts (PII is never this dense) are faster.
 
-## 对接建议（网关侧）
+---
 
-- 用核心包 import 的方式，没有 HTTP/gRPC 跳转，也就没有超时与 fail-open/closed 问题。
-- 若用 HTTP/gRPC 服务：设 150–300ms 超时；失败时建议 fail-closed（拒绝请求而非放行原文）。
+## Integration notes (gateway side)
 
-## 备注
+- With the core-package import there is no HTTP/gRPC hop, hence no timeout and no fail-open/closed concerns.
+- If you use the HTTP/gRPC service: set a 150–300ms timeout; on failure, prefer fail-closed (reject the request rather than forwarding the raw text).
 
-- gitleaks 规则在 Go 下 **222 条全部原生编译**（Go 的 `regexp` 即 RE2，与 gitleaks 同源；
-  早先 Python 版因 RE2 专有语法丢了 26 条）。
-- Go `regexp` 线性时间，无灾难性回溯（ReDoS）风险。
-- gitleaks 不支持前后向断言，手机号/身份证等的数字边界用匹配后手工校验实现。
-- 不识别人名/地名/机构。若日后要补，建议走规则（中文地址正则可行；人名宜上下文锚定）。
-- 高熵兜底会误伤 git SHA、长 base64 串等 —— 可调阈值或加白名单。
+---
+
+## Notes
+
+- All **222 gitleaks rules compile natively** in Go (Go's `regexp` is RE2, the same engine gitleaks uses;
+  an earlier Python port lost 26 rules to RE2-incompatible syntax).
+- Go `regexp` runs in linear time — no catastrophic backtracking (ReDoS) risk.
+- gitleaks does not support look-around assertions, so digit boundaries for phone / national ID etc. are
+  enforced by manual post-match validation.
+- No person / place / organization recognition. If added later, prefer rules (a Chinese-address regex is
+  feasible; names are better anchored by context).
+- The entropy fallback can mis-flag git SHAs, long base64 strings, etc. — tune the threshold or add an allowlist.
+```
