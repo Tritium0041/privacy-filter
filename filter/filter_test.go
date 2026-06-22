@@ -2,6 +2,7 @@ package filter
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -86,6 +87,32 @@ func TestEntropyFallback(t *testing.T) {
 	f := newFilter(t)
 	if got := redact(t, f, "临时凭证 aB3xK9pLmN2qR7sT5vW1zY 已生成"); !strings.Contains(got, "[密钥]") {
 		t.Errorf("高熵随机串未脱敏: %q", got)
+	}
+}
+
+func TestDisableEntropyFallbackKeepsExplicitSecrets(t *testing.T) {
+	f, err := NewWithOptions("../rules/gitleaks.toml", Options{DisableEntropyFallback: true})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	clean := []string{
+		"临时凭证 aB3xK9pLmN2qR7sT5vW1zY 已生成",
+		"TestEntropyFallbackSkipsFilesystemPath",
+		"/rollout_summaries/2026-06-10T13-36-11-FDHV-agent_scratch_tui_token_usage_and_compact_command",
+	}
+	for _, in := range clean {
+		if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+			t.Fatalf("entropy fallback disabled should not redact %q: %q", in, got)
+		}
+	}
+	secretCases := []string{
+		"配置里 api_key = aB3xK9pLmN2qR7sT",
+		"openai key sk-abcdefghijklmnopqrstT3BlbkFJabcdefghijklmnopqrst",
+	}
+	for _, in := range secretCases {
+		if got := redact(t, f, in); !strings.Contains(got, "[密钥]") {
+			t.Fatalf("explicit secret should still be redacted when entropy fallback is disabled: %q", got)
+		}
 	}
 }
 
@@ -257,6 +284,82 @@ func TestPostValidatorSkipsHexHash(t *testing.T) {
 	}
 }
 
+func TestSecretDetectorSkipsJSONControlStructure(t *testing.T) {
+	f := newFilter(t)
+	in := `{"store":false,"stream":true,"include":["reasoning.encrypted_content"],"reasoning":{"effort":"low"},"text":{"verbosity":"medium"}}`
+	res := f.RedactReversible(in)
+	if res.Redacted != in {
+		t.Fatalf("JSON control structure should not be redacted:\n%s", res.Redacted)
+	}
+	if len(res.Mapping) != 0 {
+		t.Fatalf("unexpected mapping: %#v", res.Mapping)
+	}
+}
+
+func TestSecretDetectorSkipsLLMControlIDs(t *testing.T) {
+	f := newFilter(t)
+	cases := []string{
+		`call_UF2qV5FnFjz1lPb87HUyEDoN`,
+		`resp_abcDEF1234567890xyzUVW`,
+		`msg_abcDEF1234567890xyzUVW`,
+		`item_abcDEF1234567890xyzUVW`,
+		`toolu_abcDEF1234567890xyzUVW`,
+		`conv_abcDEF1234567890xyzUVW`,
+		`sess_abcDEF1234567890xyzUVW`,
+		`evt_abcDEF1234567890xyzUVW`,
+		`chatcmpl-abcDEF1234567890xyzUVW`,
+	}
+	for _, in := range cases {
+		if got := redact(t, f, in); strings.Contains(got, "[密钥]") {
+			t.Fatalf("LLM control id should not be redacted: in=%q got=%q", in, got)
+		}
+	}
+}
+
+func TestSecretDetectorSkipsExistingRedactionPlaceholders(t *testing.T) {
+	f := newFilter(t)
+	cases := []string{
+		`token: [密钥]`,
+		`token: [密钥]\`,
+		`token: [密钥]\\`,
+		`密钥=[密钥_0]`,
+		`secret: [邮箱_12]\\`,
+		`{"x":"token: [密钥]\\"}`,
+		`{"x":"token: [密钥]\" still quoted"}`,
+	}
+	for _, in := range cases {
+		res := f.RedactReversible(in)
+		if res.Redacted != in || len(res.Mapping) != 0 {
+			t.Fatalf("existing placeholder should not be redacted: in=%q redacted=%q mapping=%#v", in, res.Redacted, res.Mapping)
+		}
+	}
+}
+
+func TestSecretDetectorSkipsToolOutputPrivateKeyProse(t *testing.T) {
+	f := newFilter(t)
+	longToolOutput := strings.Repeat("PRIVATE KEY note: this is documentation and tool output, not a PEM block. ", 90)
+	in := `{"model":"gpt-5.5","input":[{"type":"function_call_output","call_id":"call_1","output":` +
+		fmt.Sprintf("%q", longToolOutput) +
+		`}],"stream":true}`
+	res := f.RedactReversible(in)
+	if strings.Contains(res.Redacted, "[密钥_") || strings.Contains(res.Redacted, "[密钥]") {
+		t.Fatalf("tool output prose should not be redacted as a huge secret:\n%s", res.Redacted)
+	}
+	if len(res.Mapping) != 0 {
+		t.Fatalf("unexpected mapping: %#v", res.Mapping)
+	}
+}
+
+func TestSecretDetectorKeepsPEMPrivateKey(t *testing.T) {
+	f := newFilter(t)
+	pem := "-----BEGIN PRIVATE KEY-----\n" +
+		strings.Repeat("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", 5) + "\n" +
+		"-----END PRIVATE KEY-----"
+	if got := redact(t, f, pem); !strings.Contains(got, "[密钥]") {
+		t.Fatalf("complete PEM private key should be redacted: %q", got)
+	}
+}
+
 // --- 整体行为 ---
 
 func TestCleanTextNoHit(t *testing.T) {
@@ -288,6 +391,93 @@ func TestBuiltinFallback(t *testing.T) {
 	}
 	if rules, _ := f.Stats(); rules == 0 {
 		t.Error("内置兜底规则为空")
+	}
+}
+
+func TestRedactReversibleReusesSamePlaceholder(t *testing.T) {
+	f := newFilter(t)
+	res := f.RedactReversible("发给 a@b.com，再抄送 a@b.com")
+	if res.Redacted != "发给 [邮箱_0]，再抄送 [邮箱_0]" {
+		t.Fatalf("可逆脱敏输出不符合预期: %q", res.Redacted)
+	}
+	if got := len(res.Mapping); got != 1 {
+		t.Fatalf("mapping 数量=%d，应为 1: %#v", got, res.Mapping)
+	}
+	if res.Mapping["[邮箱_0]"] != "a@b.com" {
+		t.Fatalf("mapping 不对: %#v", res.Mapping)
+	}
+	for _, e := range res.Entities {
+		if e.Type != "[邮箱]" || e.Placeholder != "[邮箱_0]" {
+			t.Fatalf("entity 类型/占位符不对: %#v", e)
+		}
+	}
+}
+
+func TestRedactReversibleCountersByType(t *testing.T) {
+	f := newFilter(t)
+	res := f.RedactReversible("邮箱 a@b.com b@c.com 手机 13900001111 密码是 Qwer1234")
+	for _, want := range []string{"[邮箱_0]", "[邮箱_1]", "[电话_0]", "[密钥_0]"} {
+		if !strings.Contains(res.Redacted, want) {
+			t.Fatalf("缺少占位符 %s: %q", want, res.Redacted)
+		}
+	}
+	for _, want := range []string{"[邮箱_0]", "[邮箱_1]", "[电话_0]", "[密钥_0]"} {
+		if _, ok := res.Mapping[want]; !ok {
+			t.Fatalf("mapping 缺少 %s: %#v", want, res.Mapping)
+		}
+	}
+}
+
+func TestRedactStillUsesStaticPlaceholders(t *testing.T) {
+	f := newFilter(t)
+	res := f.Redact("邮箱 a@b.com")
+	if res.Redacted != "邮箱 [邮箱]" {
+		t.Fatalf("Redact 输出被改变: %q", res.Redacted)
+	}
+	if len(res.Entities) != 1 || res.Entities[0].Placeholder != "" {
+		t.Fatalf("Redact 不应填充 Placeholder: %#v", res.Entities)
+	}
+}
+
+func TestRestoreText(t *testing.T) {
+	mapping := map[string]string{"[邮箱_0]": "a@b.com"}
+	got := RestoreText("发给 [邮箱_0]，未知 [邮箱_9]", mapping)
+	want := "发给 a@b.com，未知 [邮箱_9]"
+	if got != want {
+		t.Fatalf("RestoreText=%q want %q", got, want)
+	}
+}
+
+func TestRestoreJSON(t *testing.T) {
+	mapping := map[string]string{"[邮箱_0]": "a@b.com", "[电话_0]": "13900001111"}
+	in := map[string]any{
+		"to":      "[邮箱_0]",
+		"subject": "hi",
+		"nested": map[string]any{
+			"body":  "call [电话_0]",
+			"count": float64(2),
+			"ok":    true,
+			"nil":   nil,
+		},
+		"list": []any{"[邮箱_0]", float64(3)},
+	}
+	got, err := RestoreJSON(in, mapping)
+	if err != nil {
+		t.Fatalf("RestoreJSON: %v", err)
+	}
+	want := map[string]any{
+		"to":      "a@b.com",
+		"subject": "hi",
+		"nested": map[string]any{
+			"body":  "call 13900001111",
+			"count": float64(2),
+			"ok":    true,
+			"nil":   nil,
+		},
+		"list": []any{"a@b.com", float64(3)},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("RestoreJSON=%#v want %#v", got, want)
 	}
 }
 

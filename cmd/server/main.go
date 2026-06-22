@@ -16,8 +16,10 @@ import (
 	"google.golang.org/grpc"
 
 	"privacyfilter/filter"
+	"privacyfilter/internal/config"
 	"privacyfilter/internal/grpcapi"
 	"privacyfilter/internal/httpapi"
+	"privacyfilter/store"
 )
 
 func main() {
@@ -32,6 +34,12 @@ func main() {
 	}
 	rules, skipped := f.Stats()
 	log.Printf("就绪：gitleaks 规则 %d 条（跳过 %d 条不兼容）", rules, skipped)
+	sessionTTL, err := config.SessionTTL()
+	if err != nil {
+		log.Fatal(err)
+	}
+	sessions := store.NewMemoryStore()
+	log.Printf("可逆脱敏 session TTL：%s", sessionTTL)
 
 	// --- gRPC ---
 	lis, err := net.Listen("tcp", grpcAddr)
@@ -39,7 +47,7 @@ func main() {
 		log.Fatalf("gRPC 监听 %s 失败：%v", grpcAddr, err)
 	}
 	gs := grpc.NewServer()
-	grpcapi.Register(gs, f)
+	grpcapi.RegisterWithStore(gs, f, sessions, sessionTTL)
 	go func() {
 		log.Printf("gRPC 监听 %s", grpcAddr)
 		if err := gs.Serve(lis); err != nil {
@@ -50,7 +58,7 @@ func main() {
 	// --- HTTP ---
 	hs := &http.Server{
 		Addr:    httpAddr,
-		Handler: httpapi.Handler(f),
+		Handler: httpapi.HandlerWithStore(f, sessions, sessionTTL),
 	}
 	go func() {
 		log.Printf("HTTP 监听 %s", httpAddr)

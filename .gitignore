@@ -23,3 +23,9 @@ __pycache__/
 # 本地环境配置
 .env
 .env.local
+
+# 本地运行日志
+*.log
+
+*.md
+!README*.md

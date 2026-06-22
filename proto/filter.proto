@@ -10,6 +10,10 @@ service PrivacyFilter {
   rpc Redact(RedactRequest) returns (RedactResponse);
   // RedactBatch 批量脱敏。
   rpc RedactBatch(RedactBatchRequest) returns (RedactBatchResponse);
+  // RedactReversible 脱敏单条文本，并创建可还原 session。
+  rpc RedactReversible(RedactRequest) returns (RedactReversibleResponse);
+  // Restore 使用 session 还原文本或 JSON 字符串。
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
 }
 
 message RedactRequest {
@@ -22,6 +26,7 @@ message Entity {
   int32 start = 2;
   int32 end = 3;
   string text = 4;
+  string placeholder = 5;
 }
 
 message RedactResponse {
@@ -38,4 +43,28 @@ message RedactBatchRequest {
 
 message RedactBatchResponse {
   repeated RedactResponse results = 1;
+}
+
+message RedactReversibleResponse {
+  string redacted = 1;
+  bool hit = 2;
+  int32 count = 3;
+  repeated Entity entities = 4;
+  double elapsed_ms = 5;
+  string session_id = 6;
+}
+
+message RestoreRequest {
+  string session_id = 1;
+  oneof payload {
+    string text = 2;
+    string json = 3;
+  }
+}
+
+message RestoreResponse {
+  oneof payload {
+    string restored = 1;
+    string json = 2;
+  }
 }

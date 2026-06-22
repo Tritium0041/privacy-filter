@@ -12,6 +12,7 @@ const (
 	entropyMin       = 4.0 // 高熵兜底默认阈值（贴近 gitleaks 经验值）
 	entropyMinStrict = 4.8 // 周围无密钥语义关键词时启用，进一步压低误报
 	contextLookback  = 30  // hasSecretContext 往前回溯字节数
+	maxGenericSecret = 512 // 超过该长度的非结构化候选通常是日志/代码/工具输出误伤
 )
 
 // 上下文型口令：藏在句子里的密码/token，如「我的密码是 hunter2」「api_key: xxx」。
@@ -55,6 +56,12 @@ var (
 	reUUID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 	// 纯 hex（搭配长度判断 md5/sha1/sha256）。
 	reHexOnly = regexp.MustCompile(`^[0-9a-fA-F]+$`)
+	// 已有脱敏占位符，可能带着 JSON 字符串里的转义反斜杠。二次脱敏会破坏 JSON。
+	reRedactionPlaceholderValue = regexp.MustCompile(`^\[[^\]\s]{1,32}(?:_\d+)?\]\\*$`)
+	// LLM API 协议里的对象 / tool call 标识符，不是凭证。
+	reLLMControlID = regexp.MustCompile(`^(?:call|resp|msg|item|fc|rs|run|step|thread|asst|batch|conv|toolu|sess|evt|req)_[A-Za-z0-9_-]{3,}$|^(?:file|chatcmpl|cmpl)-[A-Za-z0-9_-]{3,}$`)
+	// 完整 PEM private key 块。仅出现 "PRIVATE KEY" 文本不应绕过 JSON/长文本噪声过滤。
+	rePrivateKeyBlock = regexp.MustCompile(`(?is)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----.*?-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----`)
 )
 
 // 业务标识符的常见变量名后缀。`order_id=xxxxx` 这类不应被当密钥。
@@ -101,10 +108,44 @@ func isLikelyPlaceholder(s string) bool {
 	return false
 }
 
-// hasJSONNoise 命中含 `,` —— 单 token 的真密钥不会有 `,`，gitleaks 宽规则
-// 误吃多 token 时常见。`"` 不能加进来，否则会误杀 key="..." 这种引号包裹的真密钥。
+func isPrivateKeyBlock(s string) bool {
+	return rePrivateKeyBlock.MatchString(s)
+}
+
+func isLikelyLongStructuredSecret(s string) bool {
+	if len(s) <= maxGenericSecret || isPrivateKeyBlock(s) {
+		return true
+	}
+	low := strings.ToLower(s)
+	for _, prefix := range []string{
+		"ops_eyj", "fm1r_", "fm1a_", "fm2_", "pypi-ageichlwas5vcmc",
+		"sntrys_eyj", "hvb.", "xoxe.", "xoxe-",
+	} {
+		if strings.HasPrefix(low, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasJSONNoise 命中 JSON 结构噪声。这里不能简单拒绝所有引号/冒号，
+// 因为合法密钥可能出现在 JSON value 里；只拒绝 generic 规则误吃
+// 普通 key/value 控制结构的情形。
 func hasJSONNoise(s string) bool {
-	return strings.IndexByte(s, ',') >= 0
+	if isPrivateKeyBlock(s) {
+		return false
+	}
+	if strings.IndexByte(s, ',') >= 0 {
+		return true
+	}
+	if strings.ContainsAny(s, "{}[]") {
+		return true
+	}
+	if strings.Contains(s, `":`) || strings.Contains(s, `:"`) {
+		low := strings.ToLower(s)
+		return !reSecretContext.MatchString(low)
+	}
+	return false
 }
 
 type secretRule struct {
@@ -116,8 +157,9 @@ type secretRule struct {
 }
 
 type secretDetector struct {
-	rules   []secretRule
-	skipped int // 因正则语法不兼容被跳过的规则数（Go RE2 下通常为 0）
+	rules                  []secretRule
+	skipped                int  // 因正则语法不兼容被跳过的规则数（Go RE2 下通常为 0）
+	disableEntropyFallback bool // 关闭 Route 3 高熵兜底，保留 gitleaks 和上下文口令
 }
 
 // gitleaks.toml 的最小结构；未知字段（allowlist 等）会被忽略。
@@ -209,9 +251,12 @@ func (sd *secretDetector) detect(text string) []span {
 			// （含 base64 的 / 字符）这类合法但带斜杠的密钥。
 			cand := text[s:e]
 			if looksLikeURLMatch(cand) ||
-				isTemplateVar(cand) || isHexHash(cand) || isUUID(cand) ||
+				!isLikelyLongStructuredSecret(cand) ||
+				isTemplateVar(cand) || isHexHash(cand) || isUUID(cand) || isLLMControlID(cand) ||
+				isRedactionPlaceholderValue(cand) ||
 				isBusinessIDAssignment(cand) ||
-				isLikelyPlaceholder(cand) || hasJSONNoise(cand) {
+				(isLikelyPlaceholder(cand) && !isPrivateKeyBlock(cand)) ||
+				hasJSONNoise(cand) {
 				continue
 			}
 			spans = append(spans, span{s, e, "[密钥]"})
@@ -222,7 +267,7 @@ func (sd *secretDetector) detect(text string) []span {
 		if len(m) >= 6 && m[4] >= 0 {
 			value := text[m[4]:m[5]]
 			// 模板变量（${TOKEN} / {{ X }} 等）不是真值，跳过
-			if isTemplateVar(value) {
+			if isTemplateVar(value) || isLLMControlID(value) || isRedactionPlaceholderValue(value) {
 				continue
 			}
 			// 低熵短串（"REPLACE_ME" / "TODO" / "null" / "abc" 等占位符）跳过
@@ -232,26 +277,31 @@ func (sd *secretDetector) detect(text string) []span {
 			spans = append(spans, span{m[4], m[5], "[密钥]"})
 		}
 	}
-	// 高熵兜底
-	for _, m := range reEntropyToken.FindAllStringIndex(text, -1) {
-		s, e := m[0], m[1]
-		cand := text[s:e]
+	if !sd.disableEntropyFallback {
+		// 高熵兜底
+		for _, m := range reEntropyToken.FindAllStringIndex(text, -1) {
+			s, e := m[0], m[1]
+			cand := text[s:e]
 
-		strong := hasStrongSecretContext(text, s, e)
-		// 强上下文（Bearer / token= 等）凌驾于路径检查：避免 Bearer abc/xyz== 被路径规则误放
-		if !strong && isOnPathOrURLBoundary(text, s, e) {
-			continue
-		}
-		// 形态识别：模板变量 / 标准 hash / UUID / 业务 ID 都不是密钥
-		if isTemplateVar(cand) || isHexHash(cand) || isUUID(cand) || isBusinessIDAssignment(cand) {
-			continue
-		}
-		threshold := entropyMin
-		if !hasSecretContext(text, s, e) {
-			threshold = entropyMinStrict
-		}
-		if shannonEntropy(cand) >= threshold {
-			spans = append(spans, span{s, e, "[密钥]"})
+			strong := hasStrongSecretContext(text, s, e)
+			// 强上下文（Bearer / token= 等）凌驾于路径检查：避免 Bearer abc/xyz== 被路径规则误放
+			if !strong && isOnPathOrURLBoundary(text, s, e) {
+				continue
+			}
+			// 形态识别：模板变量 / 标准 hash / UUID / 业务 ID 都不是密钥
+			if !isLikelyLongStructuredSecret(cand) ||
+				isTemplateVar(cand) || isHexHash(cand) || isUUID(cand) || isLLMControlID(cand) ||
+				isRedactionPlaceholderValue(cand) ||
+				isBusinessIDAssignment(cand) {
+				continue
+			}
+			threshold := entropyMin
+			if !hasSecretContext(text, s, e) {
+				threshold = entropyMinStrict
+			}
+			if shannonEntropy(cand) >= threshold {
+				spans = append(spans, span{s, e, "[密钥]"})
+			}
 		}
 	}
 	return spans
@@ -337,6 +387,12 @@ func isHexHash(s string) bool {
 
 // isUUID 识别标准 8-4-4-4-12 UUID。
 func isUUID(s string) bool { return reUUID.MatchString(s) }
+
+// isRedactionPlaceholderValue 识别已经脱敏过的占位符，避免二次脱敏。
+func isRedactionPlaceholderValue(s string) bool { return reRedactionPlaceholderValue.MatchString(s) }
+
+// isLLMControlID 识别 OpenAI/兼容 LLM API 的协议标识符，如 call_xxx、resp_xxx。
+func isLLMControlID(s string) bool { return reLLMControlID.MatchString(s) }
 
 // isBusinessIDAssignment 看 = 左边的变量名是否以业务 ID 后缀结尾（_id / _uuid / _no ...）。
 // 这类是业务标识符，不是凭证。但若变量名同时含凭证语义词（key/secret/token/auth/password

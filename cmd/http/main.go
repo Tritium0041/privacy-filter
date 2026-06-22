@@ -7,7 +7,9 @@ import (
 	"os"
 
 	"privacyfilter/filter"
+	"privacyfilter/internal/config"
 	"privacyfilter/internal/httpapi"
+	"privacyfilter/store"
 )
 
 func main() {
@@ -21,9 +23,15 @@ func main() {
 	}
 	rules, skipped := f.Stats()
 	log.Printf("就绪：gitleaks 规则 %d 条（跳过 %d 条不兼容）", rules, skipped)
+	sessionTTL, err := config.SessionTTL()
+	if err != nil {
+		log.Fatal(err)
+	}
+	sessions := store.NewMemoryStore()
+	log.Printf("可逆脱敏 session TTL：%s", sessionTTL)
 
 	log.Printf("HTTP 监听 %s", addr)
-	log.Fatal(http.ListenAndServe(addr, httpapi.Handler(f)))
+	log.Fatal(http.ListenAndServe(addr, httpapi.HandlerWithStore(f, sessions, sessionTTL)))
 }
 
 func envOr(key, def string) string {
